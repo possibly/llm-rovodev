@@ -1,9 +1,22 @@
 import os
 import subprocess
-from typing import Iterable, List, Optional, Tuple
+import sys
+import time
+import logging
+from typing import Iterable, List, Optional, Tuple, Dict
 
+import click
 import llm
 from pydantic import Field
+
+from llm_rovodev_debug import (
+    LOGGER as _LOGGER,
+    ensure_logger_configured as _ensure_logger_configured,
+    is_debug_enabled as _is_debug_enabled,
+    redacted_environ as _redacted_environ,
+)
+
+
 
 
 def _locate_acli_binary() -> str:
@@ -16,7 +29,28 @@ def _run_acli_rovodev(prompt: str, timeout: Optional[float] = 120.0) -> Tuple[in
 
     We pass the prompt as a single argument to avoid shell quoting issues.
     """
+    _ensure_logger_configured()
     cmd = [_locate_acli_binary(), "rovodev", "run", prompt]
+
+    # Debug: show full invocation context
+    if _is_debug_enabled():
+        _LOGGER.debug("About to spawn subprocess")
+        _LOGGER.debug("cwd=%s", os.getcwd())
+        _LOGGER.debug("timeout=%s", timeout)
+        _LOGGER.debug("command(list)=%r", cmd)
+        # For readability, also show a shell-quoted string
+        try:
+            import shlex
+
+            _LOGGER.debug("command(shlex)=%s", " ".join(shlex.quote(s) for s in cmd))
+        except Exception:
+            pass
+        # Include a redacted view of environment
+        _LOGGER.debug("env(redacted)=%r", _redacted_environ())
+        # Show the prompt explicitly too (it is already in cmd but easier to see here)
+        _LOGGER.debug("llm->subprocess prompt (verbatim)=%r", prompt)
+
+    start = time.time()
     try:
         completed = subprocess.run(
             cmd,
@@ -25,12 +59,24 @@ def _run_acli_rovodev(prompt: str, timeout: Optional[float] = 120.0) -> Tuple[in
             timeout=timeout,
             check=False,
         )
+        duration = time.time() - start
+        if _is_debug_enabled():
+            _LOGGER.debug("subprocess finished rc=%s in %.3fs", completed.returncode, duration)
+            # Avoid dumping full stdout/stderr to not leak banner content into output captures
+            _LOGGER.debug("stdout_len=%d", len(completed.stdout or ""))
+            _LOGGER.debug("stderr_len=%d", len(completed.stderr or ""))
         return completed.returncode, completed.stdout, completed.stderr
     except FileNotFoundError as e:
+        if _is_debug_enabled():
+            _LOGGER.exception("acli binary not found")
         return 127, "", f"acli binary not found: {e}"
     except subprocess.TimeoutExpired as e:
+        if _is_debug_enabled():
+            _LOGGER.exception("subprocess timed out after %ss", timeout)
         return 124, e.stdout or "", (e.stderr or "") + f"\nTimed out after {timeout}s"
     except Exception as e:  # Fallback safeguard
+        if _is_debug_enabled():
+            _LOGGER.exception("unexpected error invoking acli: %s", e)
         return 1, "", f"Unexpected error invoking acli: {e}"
 
 
@@ -123,8 +169,19 @@ class RovoDev(llm.Model):
         exit_code, stdout, stderr = _run_acli_rovodev(user_text, timeout=120.0)
 
         model_name = _extract_model(stdout)
-        parsed = None if opts.raw else _parse_response_block(stdout)
-        content = stdout if (opts.raw or parsed is None) else parsed
+
+        # Always attempt to parse a Response block first
+        parsed = _parse_response_block(stdout)
+        if parsed is None:
+            # No model response found; raise a clear error
+            # Include a hint for users on how to inspect full raw output
+            raise click.ClickException(
+                "No Response block found in rovodev CLI output. "
+                "Enable LLM_ROVODEV_DEBUG=1 to capture full logs or run the rovodev CLI directly to debug."
+            )
+
+        # If a Response block exists, choose output based on raw option
+        content = stdout if opts.raw else parsed
 
         # Record metadata for observability
         response.response_json = {
@@ -133,13 +190,13 @@ class RovoDev(llm.Model):
             "exit_code": exit_code,
             "raw_stdout_len": len(stdout),
             "stderr_len": len(stderr or ""),
-            "parsed": parsed is not None and not opts.raw,
+            "parsed": True,
         }
         if stderr:
             response.response_json["stderr_preview"] = stderr[:4000]
 
-        # If external command failed, surface a helpful message but still return any content we found
-        if exit_code != 0 and not content:
+        # If external command failed and no content was produced in raw mode, surface a helpful message
+        if opts.raw and exit_code != 0 and not content:
             msg = stderr.strip() or f"'acli rovodev run' failed with exit code {exit_code}"
             content = f"Error from rovodev CLI: {msg}"
 
