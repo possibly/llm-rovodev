@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="llm-rovodev",
-    version="0.1.2",
+    version="0.1.3",
     description="LLM plugin exposing the RovoDev model for the llm CLI",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
