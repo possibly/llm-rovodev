@@ -20,13 +20,15 @@ def run_acli_rovodev(
     message_args: List[str],
     timeout: Optional[float] = 120.0,
     on_spawn: Optional[Callable[["subprocess.Popen[str]"], None]] = None,
+    extra_args: Optional[List[str]] = None,
 ) -> Tuple[int, str, str]:
-    """Run `acli rovodev run <MESSAGE>...` with one or more message arguments.
+    """Run `acli rovodev run <EXTRA_ARGS...> <MESSAGE>...` with one or more message arguments.
 
     We avoid shell=True and pass args as a list to preserve whitespace safely.
     """
     _ensure_logger_configured()
-    cmd = [locate_acli_binary(), "rovodev", "run", *message_args]
+    extra_args = extra_args or []
+    cmd = [locate_acli_binary(), "rovodev", "run", *extra_args, *message_args]
 
     # Debug: show full invocation context
     if _is_debug_enabled():

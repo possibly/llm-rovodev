@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import click
 import llm
-from pydantic import Field
+from pydantic import Field, ConfigDict
 
 from llm_rovodev_debug import (
     LOGGER as _LOGGER,
@@ -28,6 +28,7 @@ class RovoDev(llm.Model):
     can_stream = True
 
     class Options(llm.Options):
+        model_config = ConfigDict(extra="allow")
         raw: bool = Field(
             default=False,
             description="If true, return raw stdout from 'acli rovodev run' without parsing the Response block.",
@@ -35,6 +36,14 @@ class RovoDev(llm.Model):
         timeout_seconds: float = Field(
             default=600.0,
             description="Timeout in seconds for the external 'acli rovodev run' process (default 600s).",
+        )
+        yolo: bool = Field(
+            default=False,
+            description="If true, forward --yolo to 'acli rovodev run'.",
+        )
+        config_file: Optional[str] = Field(
+            default=None,
+            description="If set, forward --config-file <path> to 'acli rovodev run'.",
         )
 
     def execute(
@@ -102,11 +111,47 @@ class RovoDev(llm.Model):
         # Prepare message args, possibly writing a long prompt to a dot temp file
         message_args, dot_file = prepare_message_args_from_prompt(user_text)
 
+        # Build any pass-through args for the external CLI
+        extra_args: List[str] = []
+        try:
+            if bool(getattr(opts, "yolo", False)):
+                extra_args.append("--yolo")
+        except Exception:
+            pass
+        # config-file may be provided as -o config-file <path> which ends up
+        # either in opts.config_file or in pydantic's extras under 'config-file'
+        cfg = None
+        try:
+            cfg = getattr(opts, "config_file", None)
+        except Exception:
+            cfg = None
+        if not cfg:
+            extras = None
+            try:
+                extras = getattr(opts, "model_extra", None)
+            except Exception:
+                extras = None
+            if extras is None:
+                try:
+                    # pydantic internal name for extras in some versions
+                    extras = getattr(opts, "__pydantic_extra__", None)
+                except Exception:
+                    extras = None
+            if isinstance(extras, dict):
+                cfg = extras.get("config-file") or extras.get("config_file")
+        if cfg:
+            try:
+                import os as _os
+                normalized_cfg = _os.path.abspath(_os.path.expanduser(str(cfg)))
+            except Exception:
+                normalized_cfg = str(cfg)
+            extra_args.extend(["--config-file", normalized_cfg])
+
         # Use user-configurable timeout; default is 600s, minimum 120s
         _t = float(opts.timeout_seconds or 600.0)
         if _t < 120.0:
             _t = 120.0
-        exit_code, stdout, stderr = run_acli_rovodev(message_args, timeout=_t)
+        exit_code, stdout, stderr = run_acli_rovodev(message_args, timeout=_t, extra_args=extra_args)
 
         model_name = extract_model(stdout)
 
