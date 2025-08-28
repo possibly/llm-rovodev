@@ -82,3 +82,5 @@ Thumbs.db
 # Local builds
 *.bak
 *.orig
+
+.llm-rovodev/*

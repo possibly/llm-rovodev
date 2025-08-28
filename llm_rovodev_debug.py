@@ -5,9 +5,13 @@ from typing import Dict
 
 _DEBUG_ENV_VAR = "LLM_ROVODEV_DEBUG"
 
-# Shared logger for the plugin
+# Shared logger for the plugin (general context logs)
 LOGGER = logging.getLogger("llm_rovodev")
 LOGGER.setLevel(logging.INFO)
+# Dedicated logger for full stdio dumps – always send to stderr to avoid
+# polluting stdout-only captures in some environments
+STDIO_LOGGER = logging.getLogger("llm_rovodev.stdio")
+STDIO_LOGGER.setLevel(logging.INFO)
 
 
 def is_truthy_env(name: str) -> bool:
@@ -20,11 +24,11 @@ def is_debug_enabled() -> bool:
 
 
 def ensure_logger_configured() -> None:
-    """Attach a stream handler to LOGGER when debug is enabled.
+    """Attach stream handlers when debug is enabled.
 
-    - If stdout is redirected (non-tty), emit logs to stdout so users can redirect `>` and capture logs.
-    - Otherwise, emit logs to stderr.
-    - Avoid attaching duplicate handlers to the same stream.
+    - Context logger (LOGGER): emit to stdout if stdout is redirected; else stderr.
+    - STDIO_LOGGER: always emit to stderr to avoid mixing with normal output.
+    - Avoid duplicate handlers to the same streams.
     """
     if not is_debug_enabled():
         return
@@ -33,18 +37,32 @@ def ensure_logger_configured() -> None:
         stdout_is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     except Exception:
         stdout_is_tty = True
-    stream = sys.stdout if not stdout_is_tty else sys.stderr
+    ctx_stream = sys.stdout if not stdout_is_tty else sys.stderr
+    stdio_stream = sys.stderr
 
+    # Configure context logger
     for h in LOGGER.handlers:
-        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stream:
-            return
+        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is ctx_stream:
+            break
+    else:
+        handler = logging.StreamHandler(stream=ctx_stream)
+        fmt = "[llm-rovodev] %(levelname)s: %(message)s"
+        handler.setFormatter(logging.Formatter(fmt))
+        handler.setLevel(logging.DEBUG)
+        LOGGER.addHandler(handler)
+        LOGGER.setLevel(logging.DEBUG)
 
-    handler = logging.StreamHandler(stream=stream)
-    fmt = "[llm-rovodev] %(levelname)s: %(message)s"
-    handler.setFormatter(logging.Formatter(fmt))
-    handler.setLevel(logging.DEBUG)
-    LOGGER.addHandler(handler)
-    LOGGER.setLevel(logging.DEBUG)
+    # Configure STDIO logger (stderr only)
+    for h in STDIO_LOGGER.handlers:
+        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is stdio_stream:
+            break
+    else:
+        s_handler = logging.StreamHandler(stream=stdio_stream)
+        s_fmt = "[llm-rovodev] %(levelname)s: %(message)s"
+        s_handler.setFormatter(logging.Formatter(s_fmt))
+        s_handler.setLevel(logging.DEBUG)
+        STDIO_LOGGER.addHandler(s_handler)
+        STDIO_LOGGER.setLevel(logging.DEBUG)
 
 
 def _mask_value(key: str, value: str) -> str:

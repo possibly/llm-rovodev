@@ -1,9 +1,7 @@
 import os
-import subprocess
 import sys
-import time
 import logging
-from typing import Iterable, List, Optional, Tuple, Dict
+from typing import Iterable, List, Optional, Tuple
 
 import click
 import llm
@@ -11,134 +9,19 @@ from pydantic import Field
 
 from llm_rovodev_debug import (
     LOGGER as _LOGGER,
-    ensure_logger_configured as _ensure_logger_configured,
     is_debug_enabled as _is_debug_enabled,
-    redacted_environ as _redacted_environ,
 )
 
-
-
-
-def _locate_acli_binary() -> str:
-    """Return the CLI binary to call. Allow override via ACLI_BIN env var."""
-    return os.environ.get("ACLI_BIN", "acli")
-
-
-def _run_acli_rovodev(prompt: str, timeout: Optional[float] = 120.0) -> Tuple[int, str, str]:
-    """Run `acli rovodev run <prompt>` and capture exit code, stdout, stderr.
-
-    We pass the prompt as a single argument to avoid shell quoting issues.
-    """
-    _ensure_logger_configured()
-    cmd = [_locate_acli_binary(), "rovodev", "run", prompt]
-
-    # Debug: show full invocation context
-    if _is_debug_enabled():
-        _LOGGER.debug("About to spawn subprocess")
-        _LOGGER.debug("cwd=%s", os.getcwd())
-        _LOGGER.debug("timeout=%s", timeout)
-        _LOGGER.debug("command(list)=%r", cmd)
-        # For readability, also show a shell-quoted string
-        try:
-            import shlex
-
-            _LOGGER.debug("command(shlex)=%s", " ".join(shlex.quote(s) for s in cmd))
-        except Exception:
-            pass
-        # Include a redacted view of environment
-        _LOGGER.debug("env(redacted)=%r", _redacted_environ())
-        # Show the prompt explicitly too (it is already in cmd but easier to see here)
-        _LOGGER.debug("llm->subprocess prompt (verbatim)=%r", prompt)
-
-    start = time.time()
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        duration = time.time() - start
-        if _is_debug_enabled():
-            _LOGGER.debug("subprocess finished rc=%s in %.3fs", completed.returncode, duration)
-            # Avoid dumping full stdout/stderr to not leak banner content into output captures
-            _LOGGER.debug("stdout_len=%d", len(completed.stdout or ""))
-            _LOGGER.debug("stderr_len=%d", len(completed.stderr or ""))
-        return completed.returncode, completed.stdout, completed.stderr
-    except FileNotFoundError as e:
-        if _is_debug_enabled():
-            _LOGGER.exception("acli binary not found")
-        return 127, "", f"acli binary not found: {e}"
-    except subprocess.TimeoutExpired as e:
-        if _is_debug_enabled():
-            _LOGGER.exception("subprocess timed out after %ss", timeout)
-        return 124, e.stdout or "", (e.stderr or "") + f"\nTimed out after {timeout}s"
-    except Exception as e:  # Fallback safeguard
-        if _is_debug_enabled():
-            _LOGGER.exception("unexpected error invoking acli: %s", e)
-        return 1, "", f"Unexpected error invoking acli: {e}"
-
-
-def _extract_model(stdout: str) -> Optional[str]:
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("Using model:"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-def _parse_response_block(stdout: str) -> Optional[str]:
-    """Extract the text inside the box-drawn "Response" section from acli output.
-
-    Looks for a line that includes 'Response' and starts with the box-drawing top-left corner.
-    Then collects subsequent lines that start with a vertical box char, trimming the borders,
-    until the closing border line is encountered.
-
-    Returns None if a response block could not be identified.
-    """
-    lines = stdout.splitlines()
-    in_block = False
-    content: List[str] = []
-
-    for raw in lines:
-        line = raw.rstrip("\n")
-        if not in_block:
-            # Try to detect the start of the Response block
-            # Common pattern: "╭─ Response ...╮"
-            start = line.strip().startswith("╭") and ("Response" in line)
-            if start:
-                in_block = True
-            continue
-        # If we are in the block, stop at the closing border line
-        stripped = line.strip()
-        if stripped.startswith("╰"):
-            break
-        # Extract text between vertical borders: "│ ... │"
-        if "│" in line:
-            try:
-                left = line.index("│")
-                right = line.rindex("│")
-                if right > left:
-                    inner = line[left + 1 : right]
-                    content.append(inner.strip())
-                    continue
-            except ValueError:
-                pass
-        # Fallback: if no borders found, treat as plain content
-        content.append(stripped)
-
-    if not content:
-        return None
-    # Normalize trailing whitespace and blank lines
-    # Keep intentional blank lines present in content
-    # Strip leading/trailing empty lines
-    while content and not content[0].strip():
-        content.pop(0)
-    while content and not content[-1].strip():
-        content.pop()
-    return "\n".join(content)
-
+# Modularized helpers
+from llm_rovodev_cli import run_acli_rovodev
+from llm_rovodev_parser import (
+    extract_model,
+    detect_ai_policy_filter,
+    parse_all_response_blocks,
+)
+from llm_rovodev_prompt import (
+    prepare_message_args_from_prompt,
+)
 
 class RovoDev(llm.Model):
     model_id = "rovodev"
@@ -148,6 +31,10 @@ class RovoDev(llm.Model):
         raw: bool = Field(
             default=False,
             description="If true, return raw stdout from 'acli rovodev run' without parsing the Response block.",
+        )
+        timeout_seconds: float = Field(
+            default=600.0,
+            description="Timeout in seconds for the external 'acli rovodev run' process (default 600s).",
         )
 
     def execute(
@@ -162,19 +49,89 @@ class RovoDev(llm.Model):
         We capture stdout/stderr, parse the 'Response' content block, and stream or return it.
         When streaming is enabled, we emit line-by-line (with optional delay).
         """
-        user_text: str = prompt.prompt or ""
+        # Build full prompt including any fragments provided with -f
+        def _safe_fragment_to_text(frag) -> Optional[str]:
+            # Try common attributes used by LLM fragments
+            for attr in ("content", "text", "value"):
+                try:
+                    v = getattr(frag, attr, None)
+                except Exception:
+                    v = None
+                if isinstance(v, str) and v:
+                    return v
+            # Fallback: str(frag) if it looks like text
+            try:
+                s = str(frag)
+                # Heuristic: avoid noisy reprs
+                if isinstance(s, str) and len(s) > 0 and not s.startswith("<"):
+                    return s
+            except Exception:
+                pass
+            return None
+
+        fragments_text: List[str] = []
+        try:
+            frags = getattr(prompt, "fragments", None)
+        except Exception:
+            frags = None
+        if isinstance(frags, (list, tuple)):
+            for f in frags:
+                t = _safe_fragment_to_text(f)
+                if t:
+                    fragments_text.append(t)
+        # Deduplicate identical fragment texts while preserving order
+        if fragments_text:
+            seen = set()
+            deduped: List[str] = []
+            for t in fragments_text:
+                key = "\n".join(t.splitlines()).strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(t)
+            fragments_text = deduped
+
+        base_text: str = (getattr(prompt, "prompt", None) or "")
+        if fragments_text:
+            user_text = "\n\n".join(fragments_text + ([base_text] if base_text else []))
+        else:
+            user_text = base_text
+
         opts: RovoDev.Options = prompt.options or RovoDev.Options()
 
-        # Use a sensible internal default timeout, not user-configurable
-        exit_code, stdout, stderr = _run_acli_rovodev(user_text, timeout=120.0)
+        # Prepare message args, possibly writing a long prompt to a dot temp file
+        message_args, dot_file = prepare_message_args_from_prompt(user_text)
 
-        model_name = _extract_model(stdout)
+        # Use user-configurable timeout; default is 600s, minimum 120s
+        _t = float(opts.timeout_seconds or 600.0)
+        if _t < 120.0:
+            _t = 120.0
+        exit_code, stdout, stderr = run_acli_rovodev(message_args, timeout=_t)
 
-        # Always attempt to parse a Response block first
-        parsed = _parse_response_block(stdout)
+        model_name = extract_model(stdout)
+
+        # Detect Atlassian AI Policy Filter blocks before parsing normal response
+        ai_filter = detect_ai_policy_filter(stdout)
+        if ai_filter:
+            raise click.ClickException(
+                "Your prompt was blocked by the Atlassian AI policy filter. "
+                "Try rephrasing and trying again. Details:\n" + ai_filter
+            )
+
+        # Always attempt to parse all Response blocks and join them
+        parsed_blocks = parse_all_response_blocks(stdout)
+        parsed = "\n\n".join(parsed_blocks) if parsed_blocks else None
         if parsed is None:
-            # No model response found; raise a clear error
-            # Include a hint for users on how to inspect full raw output
+            # No model response found; optionally log details in debug mode
+            if _is_debug_enabled():
+                _LOGGER.debug("No Response block found in rovodev CLI output; stdout_len=%d stderr_len=%d", len(stdout or ""), len(stderr or ""))
+                try:
+                    from llm_rovodev_debug import STDIO_LOGGER as _STDIO_LOGGER
+                except Exception:
+                    _STDIO_LOGGER = _LOGGER
+                _STDIO_LOGGER.debug("stdout (full):\n%s", stdout or "")
+                _STDIO_LOGGER.debug("stderr (full):\n%s", stderr or "")
+            # Raise a clear error with hint for users
             raise click.ClickException(
                 "No Response block found in rovodev CLI output. "
                 "Enable LLM_ROVODEV_DEBUG=1 to capture full logs or run the rovodev CLI directly to debug."
@@ -194,6 +151,9 @@ class RovoDev(llm.Model):
         }
         if stderr:
             response.response_json["stderr_preview"] = stderr[:4000]
+        if dot_file:
+            # Include the dot-file name so users can inspect or clean it up
+            response.response_json["dot_prompt_file"] = dot_file
 
         # If external command failed and no content was produced in raw mode, surface a helpful message
         if opts.raw and exit_code != 0 and not content:
